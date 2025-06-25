@@ -1,132 +1,88 @@
 /**
- * Running a local relay server will allow you to hide your API key
- * and run custom logic on the server
- *
- * Set the local relay server address to:
- * REACT_APP_LOCAL_RELAY_SERVER_URL=http://localhost:8081
- *
- * This will also require you to set OPENAI_API_KEY= in a `.env` file
- * You can run it with `npm run relay`, in parallel with `npm start`
+ * Voice Chat Console Page integrated with WebSocket server
+ * Connects to local sockets.py server at ws://localhost:8000/ws
  */
-const LOCAL_RELAY_SERVER_URL: string =
-  process.env.REACT_APP_LOCAL_RELAY_SERVER_URL || '';
 
 import { useEffect, useRef, useCallback, useState } from 'react';
-
-import { RealtimeClient } from '@openai/realtime-api-beta';
-import { ItemType } from '@openai/realtime-api-beta/dist/lib/client.js';
 import { WavRecorder, WavStreamPlayer } from '../lib/wavtools/index.js';
-import { instructions } from '../utils/conversation_config.js';
 import { WavRenderer } from '../utils/wav_renderer';
 
-import { X, Edit, Zap, ArrowUp, ArrowDown } from 'react-feather';
+import { X, Edit, Zap, ArrowUp, ArrowDown, Mic, MicOff, Volume2, VolumeX } from 'react-feather';
 import { Button } from '../components/button/Button';
 import { Toggle } from '../components/toggle/Toggle';
-import { Map } from '../components/Map';
 
 import './ConsolePage.scss';
-import { isJsxOpeningLikeElement } from 'typescript';
 
 /**
- * Type for result from get_weather() function call
+ * Type for WebSocket messages
  */
-interface Coordinates {
-  lat: number;
-  lng: number;
-  location?: string;
-  temperature?: {
-    value: number;
-    units: string;
-  };
-  wind_speed?: {
-    value: number;
-    units: string;
-  };
+interface WebSocketMessage {
+  type: string;
+  [key: string]: any;
 }
 
 /**
- * Type for all event logs
+ * Type for conversation items
  */
-interface RealtimeEvent {
-  time: string;
-  source: 'client' | 'server';
-  count?: number;
-  event: { [key: string]: any };
+interface ConversationItem {
+  id: string;
+  timestamp: string;
+  type: 'user' | 'assistant' | 'system';
+  transcript?: string;
+  response?: string;
+  audio_url?: string;
+}
+
+/**
+ * Type for system logs
+ */
+interface SystemLog {
+  id: string;
+  timestamp: string;
+  message: string;
+  type: 'info' | 'success' | 'warning' | 'error';
+  source: 'client' | 'server' | 'system';
 }
 
 export function ConsolePage() {
-  /**
-   * Ask user for API Key
-   * If we're using the local relay server, we don't need this
-   */
-  const apiKey = LOCAL_RELAY_SERVER_URL
-    ? ''
-    : localStorage.getItem('tmp::voice_api_key') ||
-      prompt('OpenAI API Key') ||
-      '';
-  if (apiKey !== '') {
-    localStorage.setItem('tmp::voice_api_key', apiKey);
-  }
+  // WebSocket and connection state
+  const [isConnected, setIsConnected] = useState(false);
+  const [isRecording, setIsRecording] = useState(false);
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [sessionId, setSessionId] = useState('');
+  const [serverUrl, setServerUrl] = useState('ws://localhost:8000/ws');
+  
+  // Audio and processing state
+  const [audioLevel, setAudioLevel] = useState(0);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [useManualMode, setUseManualMode] = useState(true);
+  
+  // Data state
+  const [conversationItems, setConversationItems] = useState<ConversationItem[]>([]);
+  const [systemLogs, setSystemLogs] = useState<SystemLog[]>([]);
+  const [serverInfo, setServerInfo] = useState<any>(null);
 
-  /**
-   * Instantiate:
-   * - WavRecorder (speech input)
-   * - WavStreamPlayer (speech output)
-   * - RealtimeClient (API client)
-   */
-  const wavRecorderRef = useRef<WavRecorder>(
-    new WavRecorder({ sampleRate: 24000 })
-  );
-  const wavStreamPlayerRef = useRef<WavStreamPlayer>(
-    new WavStreamPlayer({ sampleRate: 24000 })
-  );
-  const clientRef = useRef<RealtimeClient>(
-    new RealtimeClient(
-      LOCAL_RELAY_SERVER_URL
-        ? { url: LOCAL_RELAY_SERVER_URL }
-        : {
-            apiKey: apiKey,
-            dangerouslyAllowAPIKeyInBrowser: true,
-          }
-    )
-  );
-
-  /**
-   * References for
-   * - Rendering audio visualization (canvas)
-   * - Autoscrolling event logs
-   * - Timing delta for event log displays
-   */
+  // Refs
+  const wsRef = useRef<WebSocket | null>(null);
+  const wavRecorderRef = useRef<WavRecorder>(new WavRecorder({ sampleRate: 16000 }));
+  const wavStreamPlayerRef = useRef<WavStreamPlayer>(new WavStreamPlayer({ sampleRate: 16000 }));
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  
+  // Canvas refs for visualization
   const clientCanvasRef = useRef<HTMLCanvasElement>(null);
   const serverCanvasRef = useRef<HTMLCanvasElement>(null);
-  const eventsScrollHeightRef = useRef(0);
+  
+  // Scroll refs
   const eventsScrollRef = useRef<HTMLDivElement>(null);
+  const eventsScrollHeightRef = useRef(0);
   const startTimeRef = useRef<string>(new Date().toISOString());
 
   /**
-   * All of our variables for displaying application state
-   * - items are all conversation items (dialog)
-   * - realtimeEvents are event logs, which can be expanded
-   * - memoryKv is for set_memory() function
-   * - coords, marker are for get_weather() function
-   */
-  const [items, setItems] = useState<ItemType[]>([]);
-  const [realtimeEvents, setRealtimeEvents] = useState<RealtimeEvent[]>([]);
-  const [expandedEvents, setExpandedEvents] = useState<{
-    [key: string]: boolean;
-  }>({});
-  const [isConnected, setIsConnected] = useState(false);
-  const [canPushToTalk, setCanPushToTalk] = useState(true);
-  const [isRecording, setIsRecording] = useState(false);
-  const [memoryKv, setMemoryKv] = useState<{ [key: string]: any }>({});
-  const [coords, setCoords] = useState<Coordinates | null>({
-    lat: 37.775593,
-    lng: -122.418137,
-  });
-  const [marker, setMarker] = useState<Coordinates | null>(null);
-
-  /**
-   * Utility for formatting the timing of logs
+   * Utility functions
    */
   const formatTime = useCallback((timestamp: string) => {
     const startTime = startTimeRef.current;
@@ -146,147 +102,350 @@ export function ConsolePage() {
     return `${pad(m)}:${pad(s)}.${pad(hs)}`;
   }, []);
 
-  /**
-   * When you click the API key
-   */
-  const resetAPIKey = useCallback(() => {
-    const apiKey = prompt('OpenAI API Key');
-    if (apiKey !== null) {
-      localStorage.clear();
-      localStorage.setItem('tmp::voice_api_key', apiKey);
-      window.location.reload();
-    }
+  const addLog = useCallback((message: string, type: 'info' | 'success' | 'warning' | 'error' = 'info', source: 'client' | 'server' | 'system' = 'system') => {
+    const log: SystemLog = {
+      id: Date.now().toString(),
+      timestamp: new Date().toISOString(),
+      message,
+      type,
+      source
+    };
+    setSystemLogs(prev => [...prev.slice(-49), log]);
+  }, []);
+
+  const addConversationItem = useCallback((transcript: string, response: string, audio_url?: string) => {
+    const item: ConversationItem = {
+      id: Date.now().toString(),
+      timestamp: new Date().toISOString(),
+      type: 'user',
+      transcript,
+      response,
+      audio_url
+    };
+    setConversationItems(prev => [...prev.slice(-19), item]);
   }, []);
 
   /**
-   * Connect to conversation:
-   * WavRecorder taks speech input, WavStreamPlayer output, client is API client
+   * Audio initialization and management
    */
-  const connectConversation = useCallback(async () => {
-    const client = clientRef.current;
-    const wavRecorder = wavRecorderRef.current;
-    const wavStreamPlayer = wavStreamPlayerRef.current;
+  const initializeAudio = useCallback(async () => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          sampleRate: 16000,
+          channelCount: 1,
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true
+        }
+      });
 
-    // Set state variables
-    startTimeRef.current = new Date().toISOString();
-    setIsConnected(true);
-    setRealtimeEvents([]);
-    setItems(client.conversation.getItems());
+      streamRef.current = stream;
+      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)({
+        sampleRate: 16000
+      });
 
-    // Connect to microphone
-    await wavRecorder.begin();
+      const analyser = audioContextRef.current.createAnalyser();
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.8;
+      analyserRef.current = analyser;
 
-    // Connect to audio output
-    await wavStreamPlayer.connect();
+      const source = audioContextRef.current.createMediaStreamSource(stream);
+      source.connect(analyser);
 
-    // Connect to realtime API
-    await client.connect();
-    client.sendUserMessageContent([
-      {
-        type: `input_text`,
-        text: `Hello!`,
-        // text: `For testing purposes, I want you to list ten car brands. Number each item, e.g. "one (or whatever number you are one): the item name".`
-      },
-    ]);
-
-    if (client.getTurnDetectionType() === 'server_vad') {
-      await wavRecorder.record((data) => client.appendInputAudio(data.mono));
+      addLog('🎤 Microphone initialized successfully', 'success', 'client');
+      return true;
+    } catch (error: any) {
+      addLog(`❌ Microphone error: ${error.message}`, 'error', 'client');
+      return false;
     }
-  }, []);
+  }, [addLog]);
+
+  const updateAudioLevel = useCallback(() => {
+    if (!analyserRef.current) return;
+
+    const dataArray = new Uint8Array(analyserRef.current.frequencyBinCount);
+    analyserRef.current.getByteFrequencyData(dataArray);
+
+    const average = dataArray.reduce((sum, value) => sum + value, 0) / dataArray.length;
+    setAudioLevel(average / 255);
+
+    // Draw visualization
+    if (clientCanvasRef.current && isRecording) {
+      const canvas = clientCanvasRef.current;
+      const ctx = canvas.getContext('2d');
+      if (ctx) {
+        const width = canvas.width;
+        const height = canvas.height;
+
+        ctx.clearRect(0, 0, width, height);
+        ctx.fillStyle = '#0099ff';
+
+        const barWidth = width / dataArray.length * 2;
+        for (let i = 0; i < dataArray.length; i++) {
+          const barHeight = (dataArray[i] / 255) * height;
+          ctx.fillRect(i * barWidth, height - barHeight, barWidth - 1, barHeight);
+        }
+      }
+    }
+
+    animationFrameRef.current = requestAnimationFrame(updateAudioLevel);
+  }, [isRecording]);
 
   /**
-   * Disconnect and reset conversation state
+   * WebSocket connection and message handling
    */
-  const disconnectConversation = useCallback(async () => {
+  const connectWebSocket = useCallback(async () => {
+    try {
+      addLog('🔌 Connecting to voice chat server...', 'info', 'client');
+      
+      const audioInitialized = await initializeAudio();
+      if (!audioInitialized) return;
+
+      const ws = new WebSocket(serverUrl);
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        setIsConnected(true);
+        startTimeRef.current = new Date().toISOString();
+        addLog('✅ Connected to voice chat server', 'success', 'client');
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data: WebSocketMessage = JSON.parse(event.data);
+          handleWebSocketMessage(data);
+        } catch (error: any) {
+          addLog(`❌ Message parse error: ${error.message}`, 'error', 'client');
+        }
+      };
+
+      ws.onclose = () => {
+        setIsConnected(false);
+        setIsRecording(false);
+        addLog('🔌 Disconnected from server', 'warning', 'client');
+      };
+
+      ws.onerror = (error: any) => {
+        addLog(`❌ WebSocket error: ${error.message || 'Connection failed'}`, 'error', 'client');
+      };
+
+    } catch (error: any) {
+      addLog(`❌ Connection error: ${error.message}`, 'error', 'client');
+    }
+  }, [serverUrl, initializeAudio, addLog]);
+
+  const handleWebSocketMessage = useCallback((data: WebSocketMessage) => {
+    switch (data.type) {
+      case 'connected':
+        setSessionId(data.session_id);
+        setServerInfo(data.server_info);
+        addLog(`🎯 Session started: ${data.session_id}`, 'success', 'server');
+        if (data.server_info) {
+          addLog(`📊 Server config: Real APIs: ${data.server_info.use_real_apis}`, 'info', 'server');
+        }
+        break;
+
+      case 'transcript':
+        addConversationItem(data.transcript, data.response);
+        addLog(`📝 Transcript: ${data.transcript}`, 'info', 'server');
+        addLog(`🤖 Response: ${data.response}`, 'success', 'server');
+        setIsProcessing(false);
+        break;
+
+      case 'audio':
+        playAudioResponse(data.audio_data);
+        break;
+
+      case 'pong':
+        addLog('💓 Pong received', 'info', 'server');
+        break;
+
+      case 'keepalive':
+        // Silent keepalive
+        break;
+
+      case 'error':
+        addLog(`❌ Server error: ${data.message}`, 'error', 'server');
+        setIsProcessing(false);
+        break;
+
+      case 'status':
+        addLog(`📊 Status: Recording: ${data.is_recording}, Processing: ${data.is_processing}`, 'info', 'server');
+        setIsProcessing(data.is_processing);
+        break;
+
+      default:
+        addLog(`❓ Unknown message type: ${data.type}`, 'warning', 'server');
+    }
+  }, [addConversationItem, addLog]);
+
+  const playAudioResponse = useCallback(async (audioBase64: string) => {
+    try {
+      setIsPlaying(true);
+      addLog('🔊 Playing AI response...', 'info', 'client');
+
+      const audioData = atob(audioBase64);
+      const audioBuffer = new ArrayBuffer(audioData.length);
+      const view = new Uint8Array(audioBuffer);
+
+      for (let i = 0; i < audioData.length; i++) {
+        view[i] = audioData.charCodeAt(i);
+      }
+
+      const blob = new Blob([audioBuffer], { type: 'audio/wav' });
+      const audioUrl = URL.createObjectURL(blob);
+      const audio = new Audio(audioUrl);
+
+      audio.onended = () => {
+        setIsPlaying(false);
+        URL.revokeObjectURL(audioUrl);
+        addLog('✅ Audio playback completed', 'success', 'client');
+      };
+
+      audio.onerror = () => {
+        setIsPlaying(false);
+        URL.revokeObjectURL(audioUrl);
+        addLog('❌ Audio playback failed', 'error', 'client');
+      };
+
+      await audio.play();
+    } catch (error: any) {
+      setIsPlaying(false);
+      addLog(`❌ Audio play error: ${error.message}`, 'error', 'client');
+    }
+  }, [addLog]);
+
+  /**
+   * Recording functions
+   */
+  const startRecording = useCallback(async () => {
+    if (!wsRef.current || !streamRef.current) return;
+
+    try {
+      setIsRecording(true);
+      setIsProcessing(true);
+      addLog('🎤 Recording started...', 'info', 'client');
+
+      // Send start recording message
+      wsRef.current.send(JSON.stringify({
+        type: 'start_recording'
+      }));
+
+      // Setup MediaRecorder
+      mediaRecorderRef.current = new MediaRecorder(streamRef.current, {
+        mimeType: 'audio/webm;codecs=pcm',
+        audioBitsPerSecond: 16000
+      });
+
+      mediaRecorderRef.current.ondataavailable = (event) => {
+        if (event.data.size > 0 && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          const reader = new FileReader();
+          reader.onloadend = () => {
+            const base64 = (reader.result as string).split(',')[1];
+            wsRef.current!.send(JSON.stringify({
+              type: 'audio_data',
+              audio_data: base64
+            }));
+          };
+          reader.readAsDataURL(event.data);
+        }
+      };
+
+      mediaRecorderRef.current.start(1000); // Send data every 100ms
+      updateAudioLevel();
+
+    } catch (error: any) {
+      setIsRecording(false);
+      setIsProcessing(false);
+      addLog(`❌ Recording error: ${error.message}`, 'error', 'client');
+    }
+  }, [addLog, updateAudioLevel]);
+
+  const stopRecording = useCallback(() => {
+    if (!mediaRecorderRef.current || !wsRef.current) return;
+
+    try {
+      setIsRecording(false);
+      addLog('🛑 Recording stopped, processing...', 'info', 'client');
+
+      mediaRecorderRef.current.stop();
+
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+      }
+
+      // Send stop recording message
+      wsRef.current.send(JSON.stringify({
+        type: 'stop_recording'
+      }));
+
+    } catch (error: any) {
+      addLog(`❌ Stop recording error: ${error.message}`, 'error', 'client');
+      setIsProcessing(false);
+    }
+  }, [addLog]);
+
+  /**
+   * Connection management
+   */
+  const disconnectConversation = useCallback(() => {
+    if (wsRef.current) {
+      wsRef.current.close();
+    }
+
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+    }
+
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+    }
+
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+    }
+
     setIsConnected(false);
-    setRealtimeEvents([]);
-    setItems([]);
-    setMemoryKv({});
-    setCoords({
-      lat: 37.775593,
-      lng: -122.418137,
-    });
-    setMarker(null);
-
-    const client = clientRef.current;
-    client.disconnect();
-
-    const wavRecorder = wavRecorderRef.current;
-    await wavRecorder.end();
-
-    const wavStreamPlayer = wavStreamPlayerRef.current;
-    await wavStreamPlayer.interrupt();
-  }, []);
-
-  const deleteConversationItem = useCallback(async (id: string) => {
-    const client = clientRef.current;
-    client.deleteItem(id);
-  }, []);
-
-  /**
-   * In push-to-talk mode, start recording
-   * .appendInputAudio() for each sample
-   */
-  const startRecording = async () => {
-    setIsRecording(true);
-    const client = clientRef.current;
-    const wavRecorder = wavRecorderRef.current;
-    const wavStreamPlayer = wavStreamPlayerRef.current;
-    const trackSampleOffset = await wavStreamPlayer.interrupt();
-    if (trackSampleOffset?.trackId) {
-      const { trackId, offset } = trackSampleOffset;
-      await client.cancelResponse(trackId, offset);
-    }
-    await wavRecorder.record((data) => client.appendInputAudio(data.mono));
-  };
-
-  /**
-   * In push-to-talk mode, stop recording
-   */
-  const stopRecording = async () => {
     setIsRecording(false);
-    const client = clientRef.current;
-    const wavRecorder = wavRecorderRef.current;
-    await wavRecorder.pause();
-    client.createResponse();
-  };
+    setIsPlaying(false);
+    setIsProcessing(false);
+    setConversationItems([]);
+    setSystemLogs([]);
+    addLog('👋 Disconnected', 'info', 'client');
+  }, [addLog]);
+
+  const sendPing = useCallback(() => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'ping' }));
+      addLog('💓 Ping sent', 'info', 'client');
+    }
+  }, [addLog]);
+
+  const getServerStatus = useCallback(() => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify({ type: 'get_status' }));
+    }
+  }, []);
+
+  const deleteConversationItem = useCallback((id: string) => {
+    setConversationItems(prev => prev.filter(item => item.id !== id));
+  }, []);
 
   /**
-   * Switch between Manual <> VAD mode for communication
-   */
-  const changeTurnEndType = async (value: string) => {
-    const client = clientRef.current;
-    const wavRecorder = wavRecorderRef.current;
-    if (value === 'none' && wavRecorder.getStatus() === 'recording') {
-      await wavRecorder.pause();
-    }
-    client.updateSession({
-      turn_detection: value === 'none' ? null : { type: 'server_vad' },
-    });
-    if (value === 'server_vad' && client.isConnected()) {
-      await wavRecorder.record((data) => client.appendInputAudio(data.mono));
-    }
-    setCanPushToTalk(value === 'none');
-  };
-
-  /**
-   * Auto-scroll the event logs
+   * Auto-scroll effects
    */
   useEffect(() => {
     if (eventsScrollRef.current) {
       const eventsEl = eventsScrollRef.current;
       const scrollHeight = eventsEl.scrollHeight;
-      // Only scroll if height has just changed
       if (scrollHeight !== eventsScrollHeightRef.current) {
         eventsEl.scrollTop = scrollHeight;
         eventsScrollHeightRef.current = scrollHeight;
       }
     }
-  }, [realtimeEvents]);
+  }, [systemLogs]);
 
-  /**
-   * Auto-scroll the conversation logs
-   */
   useEffect(() => {
     const conversationEls = [].slice.call(
       document.body.querySelectorAll('[data-conversation-content]')
@@ -295,66 +454,39 @@ export function ConsolePage() {
       const conversationEl = el as HTMLDivElement;
       conversationEl.scrollTop = conversationEl.scrollHeight;
     }
-  }, [items]);
+  }, [conversationItems]);
 
   /**
-   * Set up render loops for the visualization canvas
+   * Cleanup on unmount
+   */
+  useEffect(() => {
+    return () => {
+      disconnectConversation();
+    };
+  }, [disconnectConversation]);
+
+  /**
+   * Server visualization (placeholder for now)
    */
   useEffect(() => {
     let isLoaded = true;
 
-    const wavRecorder = wavRecorderRef.current;
-    const clientCanvas = clientCanvasRef.current;
-    let clientCtx: CanvasRenderingContext2D | null = null;
-
-    const wavStreamPlayer = wavStreamPlayerRef.current;
-    const serverCanvas = serverCanvasRef.current;
-    let serverCtx: CanvasRenderingContext2D | null = null;
-
     const render = () => {
-      if (isLoaded) {
-        if (clientCanvas) {
-          if (!clientCanvas.width || !clientCanvas.height) {
-            clientCanvas.width = clientCanvas.offsetWidth;
-            clientCanvas.height = clientCanvas.offsetHeight;
+      if (isLoaded && serverCanvasRef.current) {
+        const canvas = serverCanvasRef.current;
+        const ctx = canvas.getContext('2d');
+        if (ctx) {
+          if (!canvas.width || !canvas.height) {
+            canvas.width = canvas.offsetWidth;
+            canvas.height = canvas.offsetHeight;
           }
-          clientCtx = clientCtx || clientCanvas.getContext('2d');
-          if (clientCtx) {
-            clientCtx.clearRect(0, 0, clientCanvas.width, clientCanvas.height);
-            const result = wavRecorder.recording
-              ? wavRecorder.getFrequencies('voice')
-              : { values: new Float32Array([0]) };
-            WavRenderer.drawBars(
-              clientCanvas,
-              clientCtx,
-              result.values,
-              '#0099ff',
-              10,
-              0,
-              8
-            );
-          }
-        }
-        if (serverCanvas) {
-          if (!serverCanvas.width || !serverCanvas.height) {
-            serverCanvas.width = serverCanvas.offsetWidth;
-            serverCanvas.height = serverCanvas.offsetHeight;
-          }
-          serverCtx = serverCtx || serverCanvas.getContext('2d');
-          if (serverCtx) {
-            serverCtx.clearRect(0, 0, serverCanvas.width, serverCanvas.height);
-            const result = wavStreamPlayer.analyser
-              ? wavStreamPlayer.getFrequencies('voice')
-              : { values: new Float32Array([0]) };
-            WavRenderer.drawBars(
-              serverCanvas,
-              serverCtx,
-              result.values,
-              '#009900',
-              10,
-              0,
-              8
-            );
+          
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          
+          if (isPlaying) {
+            // Simple visualization for playing state
+            const values = new Float32Array(10).fill(Math.random() * 0.8);
+            WavRenderer.drawBars(canvas, ctx, values, '#009900', 10, 0, 8);
           }
         }
         window.requestAnimationFrame(render);
@@ -365,163 +497,39 @@ export function ConsolePage() {
     return () => {
       isLoaded = false;
     };
-  }, []);
+  }, [isPlaying]);
 
   /**
-   * Core RealtimeClient and audio capture setup
-   * Set all of our instructions, tools, events and more
-   */
-  useEffect(() => {
-    // Get refs
-    const wavStreamPlayer = wavStreamPlayerRef.current;
-    const client = clientRef.current;
-
-    // Set instructions
-    client.updateSession({ instructions: instructions });
-    // Set transcription, otherwise we don't get user transcriptions back
-    client.updateSession({ input_audio_transcription: { model: 'whisper-1' } });
-
-    // Add tools
-    client.addTool(
-      {
-        name: 'set_memory',
-        description: 'Saves important data about the user into memory.',
-        parameters: {
-          type: 'object',
-          properties: {
-            key: {
-              type: 'string',
-              description:
-                'The key of the memory value. Always use lowercase and underscores, no other characters.',
-            },
-            value: {
-              type: 'string',
-              description: 'Value can be anything represented as a string',
-            },
-          },
-          required: ['key', 'value'],
-        },
-      },
-      async ({ key, value }: { [key: string]: any }) => {
-        setMemoryKv((memoryKv) => {
-          const newKv = { ...memoryKv };
-          newKv[key] = value;
-          return newKv;
-        });
-        return { ok: true };
-      }
-    );
-    client.addTool(
-      {
-        name: 'get_weather',
-        description:
-          'Retrieves the weather for a given lat, lng coordinate pair. Specify a label for the location.',
-        parameters: {
-          type: 'object',
-          properties: {
-            lat: {
-              type: 'number',
-              description: 'Latitude',
-            },
-            lng: {
-              type: 'number',
-              description: 'Longitude',
-            },
-            location: {
-              type: 'string',
-              description: 'Name of the location',
-            },
-          },
-          required: ['lat', 'lng', 'location'],
-        },
-      },
-      async ({ lat, lng, location }: { [key: string]: any }) => {
-        setMarker({ lat, lng, location });
-        setCoords({ lat, lng, location });
-        const result = await fetch(
-          `https://api.open-meteo.com/v1/forecast?latitude=${lat}&longitude=${lng}&current=temperature_2m,wind_speed_10m`
-        );
-        const json = await result.json();
-        const temperature = {
-          value: json.current.temperature_2m as number,
-          units: json.current_units.temperature_2m as string,
-        };
-        const wind_speed = {
-          value: json.current.wind_speed_10m as number,
-          units: json.current_units.wind_speed_10m as string,
-        };
-        setMarker({ lat, lng, location, temperature, wind_speed });
-        return json;
-      }
-    );
-
-    // handle realtime events from client + server for event logging
-    client.on('realtime.event', (realtimeEvent: RealtimeEvent) => {
-      setRealtimeEvents((realtimeEvents) => {
-        const lastEvent = realtimeEvents[realtimeEvents.length - 1];
-        if (lastEvent?.event.type === realtimeEvent.event.type) {
-          // if we receive multiple events in a row, aggregate them for display purposes
-          lastEvent.count = (lastEvent.count || 0) + 1;
-          return realtimeEvents.slice(0, -1).concat(lastEvent);
-        } else {
-          return realtimeEvents.concat(realtimeEvent);
-        }
-      });
-    });
-    client.on('error', (event: any) => console.error(event));
-    client.on('conversation.interrupted', async () => {
-      const trackSampleOffset = await wavStreamPlayer.interrupt();
-      if (trackSampleOffset?.trackId) {
-        const { trackId, offset } = trackSampleOffset;
-        await client.cancelResponse(trackId, offset);
-      }
-    });
-    client.on('conversation.updated', async ({ item, delta }: any) => {
-      const items = client.conversation.getItems();
-      if (delta?.audio) {
-        wavStreamPlayer.add16BitPCM(delta.audio, item.id);
-      }
-      if (item.status === 'completed' && item.formatted.audio?.length) {
-        const wavFile = await WavRecorder.decode(
-          item.formatted.audio,
-          24000,
-          24000
-        );
-        item.formatted.file = wavFile;
-      }
-      setItems(items);
-    });
-
-    setItems(client.conversation.getItems());
-
-    return () => {
-      // cleanup; resets to defaults
-      client.reset();
-    };
-  }, []);
-
-  /**
-   * Render the application
+   * Render
    */
   return (
     <div data-component="ConsolePage">
       <div className="content-top">
         <div className="content-title">
           <img src="/openai-logomark.svg" />
-          <span>realtime console</span>
+          <span>voice chat console</span>
         </div>
         <div className="content-api-key">
-          {!LOCAL_RELAY_SERVER_URL && (
-            <Button
-              icon={Edit}
-              iconPosition="end"
-              buttonStyle="flush"
-              label={`api key: ${apiKey.slice(0, 3)}...`}
-              onClick={() => resetAPIKey()}
+          <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px', color: '#666' }}>
+            <span>Server:</span>
+            <input
+              type="text"
+              value={serverUrl}
+              onChange={(e) => setServerUrl(e.target.value)}
+              disabled={isConnected}
+              style={{
+                padding: '4px 8px',
+                border: '1px solid #ccc',
+                borderRadius: '4px',
+                fontSize: '12px',
+                width: '200px'
+              }}
             />
-          )}
+            {sessionId && <span>Session: {sessionId.slice(-8)}</span>}
+          </div>
         </div>
       </div>
+      
       <div className="content-main">
         <div className="content-logs">
           <div className="content-block events">
@@ -533,195 +541,142 @@ export function ConsolePage() {
                 <canvas ref={serverCanvasRef} />
               </div>
             </div>
-            <div className="content-block-title">events</div>
+            <div className="content-block-title">system logs</div>
             <div className="content-block-body" ref={eventsScrollRef}>
-              {!realtimeEvents.length && `awaiting connection...`}
-              {realtimeEvents.map((realtimeEvent, i) => {
-                const count = realtimeEvent.count;
-                const event = { ...realtimeEvent.event };
-                if (event.type === 'input_audio_buffer.append') {
-                  event.audio = `[trimmed: ${event.audio.length} bytes]`;
-                } else if (event.type === 'response.audio.delta') {
-                  event.delta = `[trimmed: ${event.delta.length} bytes]`;
-                }
-                return (
-                  <div className="event" key={event.event_id}>
-                    <div className="event-timestamp">
-                      {formatTime(realtimeEvent.time)}
-                    </div>
-                    <div className="event-details">
-                      <div
-                        className="event-summary"
-                        onClick={() => {
-                          // toggle event details
-                          const id = event.event_id;
-                          const expanded = { ...expandedEvents };
-                          if (expanded[id]) {
-                            delete expanded[id];
-                          } else {
-                            expanded[id] = true;
-                          }
-                          setExpandedEvents(expanded);
-                        }}
-                      >
-                        <div
-                          className={`event-source ${
-                            event.type === 'error'
-                              ? 'error'
-                              : realtimeEvent.source
-                          }`}
-                        >
-                          {realtimeEvent.source === 'client' ? (
-                            <ArrowUp />
-                          ) : (
-                            <ArrowDown />
-                          )}
-                          <span>
-                            {event.type === 'error'
-                              ? 'error!'
-                              : realtimeEvent.source}
-                          </span>
-                        </div>
-                        <div className="event-type">
-                          {event.type}
-                          {count && ` (${count})`}
-                        </div>
+              {!systemLogs.length && `awaiting connection...`}
+              {systemLogs.map((log, i) => (
+                <div className="event" key={log.id}>
+                  <div className="event-timestamp">
+                    {formatTime(log.timestamp)}
+                  </div>
+                  <div className="event-details">
+                    <div className="event-summary">
+                      <div className={`event-source ${log.type === 'error' ? 'error' : log.source}`}>
+                        {log.source === 'client' ? <ArrowUp /> : 
+                         log.source === 'server' ? <ArrowDown /> : 
+                         <span>•</span>}
+                        <span>{log.source}</span>
                       </div>
-                      {!!expandedEvents[event.event_id] && (
-                        <div className="event-payload">
-                          {JSON.stringify(event, null, 2)}
-                        </div>
-                      )}
+                      <div className="event-type" style={{ color: 
+                        log.type === 'error' ? '#dc2626' :
+                        log.type === 'success' ? '#16a34a' :
+                        log.type === 'warning' ? '#ca8a04' : '#6b7280'
+                      }}>
+                        {log.message}
+                      </div>
                     </div>
                   </div>
-                );
-              })}
+                </div>
+              ))}
             </div>
           </div>
+          
           <div className="content-block conversation">
             <div className="content-block-title">conversation</div>
             <div className="content-block-body" data-conversation-content>
-              {!items.length && `awaiting connection...`}
-              {items.map((conversationItem, i) => {
-                return (
-                  <div className="conversation-item" key={conversationItem.id}>
-                    <div className={`speaker ${conversationItem.role || ''}`}>
-                      <div>
-                        {(
-                          conversationItem.role || conversationItem.type
-                        ).replaceAll('_', ' ')}
-                      </div>
-                      <div
-                        className="close"
-                        onClick={() =>
-                          deleteConversationItem(conversationItem.id)
-                        }
-                      >
-                        <X />
-                      </div>
-                    </div>
-                    <div className={`speaker-content`}>
-                      {/* tool response */}
-                      {conversationItem.type === 'function_call_output' && (
-                        <div>{conversationItem.formatted.output}</div>
-                      )}
-                      {/* tool call */}
-                      {!!conversationItem.formatted.tool && (
-                        <div>
-                          {conversationItem.formatted.tool.name}(
-                          {conversationItem.formatted.tool.arguments})
-                        </div>
-                      )}
-                      {!conversationItem.formatted.tool &&
-                        conversationItem.role === 'user' && (
-                          <div>
-                            {conversationItem.formatted.transcript ||
-                              (conversationItem.formatted.audio?.length
-                                ? '(awaiting transcript)'
-                                : conversationItem.formatted.text ||
-                                  '(item sent)')}
-                          </div>
-                        )}
-                      {!conversationItem.formatted.tool &&
-                        conversationItem.role === 'assistant' && (
-                          <div>
-                            {conversationItem.formatted.transcript ||
-                              conversationItem.formatted.text ||
-                              '(truncated)'}
-                          </div>
-                        )}
-                      {conversationItem.formatted.file && (
-                        <audio
-                          src={conversationItem.formatted.file.url}
-                          controls
-                        />
-                      )}
+              {!conversationItems.length && `awaiting connection...`}
+              {conversationItems.map((item) => (
+                <div className="conversation-item" key={item.id}>
+                  <div className="speaker user">
+                    <div>you</div>
+                    <div className="close" onClick={() => deleteConversationItem(item.id)}>
+                      <X />
                     </div>
                   </div>
-                );
-              })}
+                  <div className="speaker-content">
+                    <div style={{ marginBottom: '8px', padding: '8px', backgroundColor: '#f0f9ff', borderRadius: '4px' }}>
+                      {item.transcript}
+                    </div>
+                    <div style={{ padding: '8px', backgroundColor: '#f0fdf4', borderRadius: '4px' }}>
+                      <strong>AI:</strong> {item.response}
+                    </div>
+                    {item.audio_url && (
+                      <audio src={item.audio_url} controls style={{ marginTop: '8px', width: '100%' }} />
+                    )}
+                  </div>
+                </div>
+              ))}
             </div>
           </div>
+          
           <div className="content-actions">
-            <Toggle
-              defaultValue={false}
-              labels={['manual', 'vad']}
-              values={['none', 'server_vad']}
-              onChange={(_, value) => changeTurnEndType(value)}
-            />
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '12px' }}>
+              <span>Mode:</span>
+              <Toggle
+                defaultValue={useManualMode}
+                labels={['auto', 'manual']}
+                values={['auto', 'manual']}
+                onChange={(enabled) => setUseManualMode(enabled)}
+              />
+            </div>
+            
             <div className="spacer" />
-            {isConnected && canPushToTalk && (
+            
+            {/* Status indicators */}
+            <div style={{ display: 'flex', alignItems: 'center', gap: '12px', fontSize: '12px' }}>
+              {isProcessing && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#f59e0b' }}>
+                  <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: '#f59e0b', animation: 'pulse 1s infinite' }}></div>
+                  Processing...
+                </div>
+              )}
+              {isPlaying && (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '4px', color: '#16a34a' }}>
+                  <Volume2 size={12} />
+                  Playing
+                </div>
+              )}
+              <div>Level: {Math.round(audioLevel * 100)}%</div>
+            </div>
+            
+            <div className="spacer" />
+            
+            {/* Recording button */}
+            {isConnected && useManualMode && (
               <Button
                 label={isRecording ? 'release to send' : 'push to talk'}
                 buttonStyle={isRecording ? 'alert' : 'regular'}
-                disabled={!isConnected || !canPushToTalk}
+                disabled={!isConnected || isProcessing}
                 onMouseDown={startRecording}
                 onMouseUp={stopRecording}
+                icon={isRecording ? MicOff : Mic}
               />
             )}
+            
+            {/* Utility buttons */}
+            {isConnected && (
+              <>
+                <Button
+                  label="ping"
+                  buttonStyle="flush"
+                  onClick={sendPing}
+                />
+                <Button
+                  label="status"
+                  buttonStyle="flush"
+                  onClick={getServerStatus}
+                />
+              </>
+            )}
+            
             <div className="spacer" />
+            
+            {/* Connect/Disconnect button */}
             <Button
               label={isConnected ? 'disconnect' : 'connect'}
               iconPosition={isConnected ? 'end' : 'start'}
               icon={isConnected ? X : Zap}
               buttonStyle={isConnected ? 'regular' : 'action'}
-              onClick={
-                isConnected ? disconnectConversation : connectConversation
-              }
+              onClick={isConnected ? disconnectConversation : connectWebSocket}
             />
           </div>
         </div>
+        
         <div className="content-right">
-          <div className="content-block map">
-            <div className="content-block-title">get_weather()</div>
-            <div className="content-block-title bottom">
-              {marker?.location || 'not yet retrieved'}
-              {!!marker?.temperature && (
-                <>
-                  <br />
-                  🌡️ {marker.temperature.value} {marker.temperature.units}
-                </>
-              )}
-              {!!marker?.wind_speed && (
-                <>
-                  {' '}
-                  🍃 {marker.wind_speed.value} {marker.wind_speed.units}
-                </>
-              )}
-            </div>
-            <div className="content-block-body full">
-              {coords && (
-                <Map
-                  center={[coords.lat, coords.lng]}
-                  location={coords.location}
-                />
-              )}
-            </div>
-          </div>
           <div className="content-block kv">
-            <div className="content-block-title">set_memory()</div>
+            <div className="content-block-title">server info</div>
             <div className="content-block-body content-kv">
-              {JSON.stringify(memoryKv, null, 2)}
+              {serverInfo ? JSON.stringify(serverInfo, null, 2) : 'Not connected'}
             </div>
           </div>
         </div>
